@@ -10,13 +10,32 @@ struct LoginScreen: View {
         NavigationStack {
             ZStack {
                 LoginWebView(coordinator: coordinator)
+
                 if case .verifying = coordinator.state {
                     Color.black.opacity(0.3).ignoresSafeArea()
-                    ProgressView("Finishing sign-in…")
-                        .tint(.white)
-                        .foregroundStyle(.white)
-                        .padding()
-                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+
+                    VStack(spacing: 12) {
+                        ProgressView()
+                            .tint(.white)
+
+                        Text("Finishing sign-in…")
+                            .font(.headline)
+
+                        Text("Checking YouTube session \(coordinator.verificationAttempt)/\(coordinator.maxVerificationAttempts)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        if !coordinator.missingCookieNames.isEmpty {
+                            Text("Waiting for: \(coordinator.missingCookieNames.joined(separator: ", "))")
+                                .font(.caption2)
+                                .multilineTextAlignment(.center)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .foregroundStyle(.white)
+                    .padding(18)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    .padding(.horizontal, 24)
                 }
             }
             .navigationTitle("Sign in")
@@ -24,6 +43,12 @@ struct LoginScreen: View {
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button("Cancel") { dismiss() }
+                }
+
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Change account") {
+                        coordinator.chooseAnotherAccount()
+                    }
                 }
             }
             .onChange(of: coordinator.state) { _, new in
@@ -34,7 +59,15 @@ struct LoginScreen: View {
                 isPresented: failureBinding,
                 presenting: failureMessage
             ) { _ in
-                Button("OK", role: .cancel) { coordinator.resetState() }
+                Button("Retry") {
+                    coordinator.retryVerification()
+                }
+                Button("Change account") {
+                    coordinator.chooseAnotherAccount()
+                }
+                Button("Cancel", role: .cancel) {
+                    dismiss()
+                }
             } message: { message in
                 Text(message)
             }
@@ -52,9 +85,7 @@ struct LoginScreen: View {
                 if case .failed = coordinator.state { return true }
                 return false
             },
-            set: { newValue in
-                if !newValue { coordinator.resetState() }
-            }
+            set: { _ in }
         )
     }
 }
