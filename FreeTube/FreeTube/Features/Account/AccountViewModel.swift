@@ -27,6 +27,9 @@ final class AccountViewModel {
             info = try await service.fetchAccountInfo()
         } catch YouTubeServiceError.notAuthenticated {
             info = nil
+            // Keep the global auth state in sync with what YouTube actually reported. Without this,
+            // one screen can show "signed out" while other screens still believe cookies are valid.
+            await session.handleExpiredSession()
         } catch {
             errorState = ErrorState(from: error)
         }
