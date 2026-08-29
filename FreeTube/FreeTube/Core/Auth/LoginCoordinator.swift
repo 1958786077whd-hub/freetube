@@ -105,7 +105,7 @@ final class LoginCoordinator: NSObject, ObservableObject {
     /// the initial navigation finished.
     func retryVerification() {
         guard let webView = activeWebView else {
-            state = .failed("The sign-in page is no longer available. Close this window and try again.")
+            state = .failed("登录页面已经失效，请关闭当前窗口后重新登录。")
             return
         }
 
@@ -120,7 +120,7 @@ final class LoginCoordinator: NSObject, ObservableObject {
     /// Return to Google's account chooser while preserving Google sessions stored inside FreeTube.
     func chooseAnotherAccount() {
         guard let webView = activeWebView else {
-            state = .failed("The sign-in page is no longer available. Close this window and try again.")
+            state = .failed("登录页面已经失效，请关闭当前窗口后重新登录。")
             return
         }
 
@@ -157,12 +157,12 @@ final class LoginCoordinator: NSObject, ObservableObject {
 
             guard !Task.isCancelled else { return }
             let missing = self.missingCookieNames.isEmpty
-                ? "Unknown session cookies"
+                ? "未知会话 Cookie"
                 : self.missingCookieNames.joined(separator: ", ")
 
             self.verificationTask = nil
             self.state = .failed(
-                "Google sign-in finished, but FreeTube could not obtain all required YouTube session cookies.\n\nMissing: \(missing)\n\nYou can retry the check or choose another Google account."
+                "Google 登录已经完成，但 FreeTube 没有获取到完整的 YouTube 登录 Cookie。\n\n缺少：\(missing)\n\n你可以重试检测，或者切换另一个 Google 账号。"
             )
         }
     }
