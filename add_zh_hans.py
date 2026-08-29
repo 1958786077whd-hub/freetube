@@ -37,6 +37,8 @@ ZH = {
     "Copy URL at current time": "复制当前时间点链接",
     "Couldn't load video": "无法加载视频",
     "Couldn't read this link": "无法读取此链接",
+    "Couldn't load the video stream.": "无法加载视频流。",
+    "Couldn't read YouTube's response.": "无法读取 YouTube 的响应。",
     "Create": "创建",
     "Create new playlist": "新建播放列表",
     "Creator": "创作者",
@@ -175,7 +177,6 @@ ZH = {
     "%lld items": "%lld 项",
     "1 (sequential)": "1（顺序）",
     "Downloading %lld%%": "正在下载 %lld%%",
-    "Already at latest (%@)": "已是最新版本（%@）",
     "Updated to %@": "已更新至 %@",
     "“%@” will be permanently removed from your device.": "“%@”将从设备中永久删除。",
     "Delete %@?": "删除 %@？",
@@ -184,6 +185,11 @@ ZH = {
     "No history": "暂无历史记录",
     "No favorites": "暂无收藏",
     "Settings saved": "设置已保存",
+    "You need to sign in to do that.": "需要先登录才能执行此操作。",
+    "YouTube is rate-limiting requests. Try again in a moment.": "YouTube 正在限制请求频率，请稍后再试。",
+    "This video is unavailable.": "此视频不可用。",
+    "Your session expired. Please sign in again.": "登录会话已过期，请重新登录。",
+    "Network error: %@": "网络错误：%@",
 }
 
 
