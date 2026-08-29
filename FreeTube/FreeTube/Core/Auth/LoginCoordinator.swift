@@ -142,6 +142,13 @@ final class LoginCoordinator: NSObject, ObservableObject {
     }
 
     private func beginVerification(in webView: WKWebView) {
+        // WKNavigationDelegate calls us on both didCommit and didFinish for the same page.
+        // Do not cancel/restart an in-flight verifier; doing so can cancel the final account
+        // validation request at exactly the wrong moment and surface a false login failure.
+        if state == .verifying, verificationTask != nil {
+            return
+        }
+
         verificationTask?.cancel()
         missingCookieNames = []
         verificationAttempt = 0
@@ -217,21 +224,29 @@ final class LoginCoordinator: NSObject, ObservableObject {
             return false
         }
 
+        guard !Task.isCancelled else { return true }
+
         log.info("[login] required cookies present, applying session and validating with YouTube")
         await session.signIn(with: header)
         missingCookieNames = []
 
         do {
             _ = try await accountService.fetchAccountInfo()
+            guard !Task.isCancelled else { return true }
             state = .succeeded
             log.info("[login] account validation succeeded — state=.succeeded")
             return true
+        } catch is CancellationError {
+            log.debug("[login] account validation cancelled because login flow changed")
+            return true
         } catch YouTubeServiceError.notAuthenticated {
+            guard !Task.isCancelled else { return true }
             log.notice("[login] cookie names were complete but YouTube rejected the session")
             await session.signOut()
             state = .failed("Cookie 已获取完整，但 YouTube 没有接受这个登录会话。\n\n请点“切换账号”重新登录。")
             return true
         } catch {
+            guard !Task.isCancelled else { return true }
             log.error("[login] account validation request failed: \(String(describing: error), privacy: .public)")
             state = .failed("登录 Cookie 已获取，但验证账号时网络请求失败：\n\n\(error.localizedDescription)\n\n请检查网络后点“重试”。")
             return true
