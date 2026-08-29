@@ -28,6 +28,7 @@ final class LoginCoordinator: NSObject, ObservableObject {
 
     private let log = AppLog(subsystem: "com.leshko.freetube", category: "LoginCoordinator")
     private let session = SessionManager.shared
+    private let accountService = AccountService()
     private weak var activeWebView: WKWebView?
     private var verificationTask: Task<Void, Never>?
 
@@ -39,9 +40,6 @@ final class LoginCoordinator: NSObject, ObservableObject {
         state = .idle
     }
 
-    /// Use Google's account chooser instead of a passive ServiceLogin request. When the persistent
-    /// WKWebView store already contains Google sessions, this lets the user choose among accounts
-    /// previously used inside FreeTube rather than silently reusing one account.
     static let startURL: URL = {
         var components = URLComponents(string: "https://accounts.google.com/AccountChooser")!
         components.queryItems = [
@@ -54,9 +52,6 @@ final class LoginCoordinator: NSObject, ObservableObject {
     static let signedInHostFragment = "youtube.com"
     static let youTubeLandingURL = URL(string: "https://www.youtube.com/")!
 
-    /// Called once when the login web view is created. Keep Google cookies so FreeTube can remember
-    /// its own Google account chooser, but remove old YouTube cookies so stale YouTube sessions are
-    /// not mistaken for the account the user is signing into now.
     func prepareForLogin(in webView: WKWebView) async {
         activeWebView = webView
         verificationTask?.cancel()
@@ -94,15 +89,23 @@ final class LoginCoordinator: NSObject, ObservableObject {
             return
         }
 
-        if url.host?.contains("accounts.google.com") == true {
-            if state != .loading {
-                state = .awaitingCredentials
-            }
+        if url.host?.contains("accounts.google.com") == true, state != .loading {
+            state = .awaitingCredentials
         }
     }
 
-    /// Re-load YouTube and re-check cookies. Useful when Google's cookie write lands slightly after
-    /// the initial navigation finished.
+    func handleWebViewFailure(_ error: Error) {
+        let nsError = error as NSError
+        if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
+            return
+        }
+
+        verificationTask?.cancel()
+        verificationTask = nil
+        log.error("[login] web view navigation failed: \(error.localizedDescription, privacy: .public)")
+        state = .failed("Google 登录页面加载失败：\(error.localizedDescription)\n\n请检查网络后重试。")
+    }
+
     func retryVerification() {
         guard let webView = activeWebView else {
             state = .failed("登录页面已经失效，请关闭当前窗口后重新登录。")
@@ -117,7 +120,6 @@ final class LoginCoordinator: NSObject, ObservableObject {
         webView.load(URLRequest(url: Self.youTubeLandingURL))
     }
 
-    /// Return to Google's account chooser while preserving Google sessions stored inside FreeTube.
     func chooseAnotherAccount() {
         guard let webView = activeWebView else {
             state = .failed("登录页面已经失效，请关闭当前窗口后重新登录。")
@@ -128,8 +130,15 @@ final class LoginCoordinator: NSObject, ObservableObject {
         verificationTask = nil
         missingCookieNames = []
         verificationAttempt = 0
-        state = .awaitingCredentials
-        webView.load(URLRequest(url: Self.startURL))
+        state = .loading
+
+        Task { [weak self, weak webView] in
+            guard let self, let webView else { return }
+            await self.clearYouTubeCookies(from: webView)
+            guard self.state != .succeeded else { return }
+            self.state = .awaitingCredentials
+            webView.load(URLRequest(url: Self.startURL))
+        }
     }
 
     private func beginVerification(in webView: WKWebView) {
@@ -177,7 +186,8 @@ final class LoginCoordinator: NSObject, ObservableObject {
         return false
     }
 
-    /// Returns true once a complete cookie header was captured and persisted.
+    /// Returns true when verification should stop: either YouTube confirmed the account or a
+    /// definitive validation error was shown to the user.
     private func captureCookies(from webView: WKWebView) async -> Bool {
         let cookies = await webView.configuration.websiteDataStore.httpCookieStore.allCookies()
         let ytCookies = cookies.filter {
@@ -207,12 +217,25 @@ final class LoginCoordinator: NSObject, ObservableObject {
             return false
         }
 
-        log.info("[login] required cookies present, signing in (header length=\(header.count, privacy: .public))")
+        log.info("[login] required cookies present, applying session and validating with YouTube")
         await session.signIn(with: header)
         missingCookieNames = []
-        state = .succeeded
-        log.info("[login] sign-in succeeded — state=.succeeded")
-        return true
+
+        do {
+            _ = try await accountService.fetchAccountInfo()
+            state = .succeeded
+            log.info("[login] account validation succeeded — state=.succeeded")
+            return true
+        } catch YouTubeServiceError.notAuthenticated {
+            log.notice("[login] cookie names were complete but YouTube rejected the session")
+            await session.signOut()
+            state = .failed("Cookie 已获取完整，但 YouTube 没有接受这个登录会话。\n\n请点“切换账号”重新登录。")
+            return true
+        } catch {
+            log.error("[login] account validation request failed: \(String(describing: error), privacy: .public)")
+            state = .failed("登录 Cookie 已获取，但验证账号时网络请求失败：\n\n\(error.localizedDescription)\n\n请检查网络后点“重试”。")
+            return true
+        }
     }
 
     private func clearYouTubeCookies(from webView: WKWebView) async {
@@ -231,7 +254,14 @@ final class LoginCoordinator: NSObject, ObservableObject {
         log.info("[login] cleared \(staleYouTubeCookies.count, privacy: .public) stale YouTube cookies; preserved Google account sessions")
     }
 
-    /// Wipe the app's persistent WKWebView data store at explicit sign-out time.
+    static func clearYouTubeWebSession() async {
+        let store = WKWebsiteDataStore.default().httpCookieStore
+        let cookies = await store.allCookies()
+        for cookie in cookies where cookie.domain.hasSuffix("youtube.com") {
+            await store.delete(cookie)
+        }
+    }
+
     static func clearWebData() async {
         let types: Set<String> = [
             WKWebsiteDataTypeCookies,
