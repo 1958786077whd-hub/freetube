@@ -2,6 +2,78 @@ import Foundation
 import OSLog
 import YouTubeKit
 
+/// Reads the server's authentication signals without inheriting YouTubeKit's current
+/// `isDisconnected = true` default when `mainAppWebResponseContext.loggedOut` is omitted.
+/// The account-menu endpoint is still a real authenticated YouTube endpoint; this decoder only
+/// distinguishes an explicit rejection from a changed-but-authenticated response shape.
+private struct AuthenticationProbeResponse: YouTubeResponse {
+    enum Verdict: Sendable {
+        case authenticated
+        case rejected
+        case indeterminate
+    }
+
+    static let headersType: HeaderTypes = .userAccountHeaders
+    static let parametersValidationList: ValidationList = [:]
+
+    let verdict: Verdict
+    let displayName: String?
+    let channelHandle: String?
+
+    static func decodeJSON(json: JSON) -> AuthenticationProbeResponse {
+        let loggedOut = json[
+            "responseContext",
+            "mainAppWebResponseContext",
+            "loggedOut"
+        ].bool
+
+        if loggedOut == true {
+            return AuthenticationProbeResponse(
+                verdict: .rejected,
+                displayName: nil,
+                channelHandle: nil
+            )
+        }
+
+        for action in json["actions"].arrayValue {
+            let accountHeader = action[
+                "openPopupAction",
+                "popup",
+                "multiPageMenuRenderer",
+                "header",
+                "activeAccountHeaderRenderer"
+            ]
+            guard accountHeader.exists() else { continue }
+
+            return AuthenticationProbeResponse(
+                verdict: .authenticated,
+                displayName: accountHeader["accountName", "simpleText"].string,
+                channelHandle: accountHeader["channelHandle", "simpleText"].string
+            )
+        }
+
+        if loggedOut == false {
+            return AuthenticationProbeResponse(
+                verdict: .authenticated,
+                displayName: nil,
+                channelHandle: nil
+            )
+        }
+
+        return AuthenticationProbeResponse(
+            verdict: .indeterminate,
+            displayName: nil,
+            channelHandle: nil
+        )
+    }
+}
+
+private struct AuthenticationProbeIndeterminateError: LocalizedError, Sendable {
+    var errorDescription: String? {
+        "YouTube 返回了无法识别的登录验证响应，请稍后重试。"
+    }
+}
+
 struct AccountInfo: Sendable {
     let displayName: String
     let handle: String?
@@ -32,8 +104,9 @@ protocol AccountServicing: Sendable {
 
 /// Wraps YouTubeKit's authenticated `Account*Response` types. All three require cookies on
 /// `YouTubeModel`; `SessionManager.bootstrap` / `applyCandidateCookies` is responsible for applying them.
-/// Each method throws `YouTubeServiceError.notAuthenticated` when YouTubeKit reports
-/// `isDisconnected == true` (no valid session) so the UI can route to the login screen.
+/// Authenticated methods throw `YouTubeServiceError.notAuthenticated` only after a definitive
+/// server-side logged-out result so the UI can route to the login screen without parser false
+/// negatives.
 final class AccountService: AccountServicing {
     private let client: YouTubeKitClient
     private let log = AppLog(subsystem: "com.leshko.freetube", category: "AccountService")
@@ -57,49 +130,74 @@ final class AccountService: AccountServicing {
             throw YouTubeServiceError.network(error)
         }
 
-        if response.isDisconnected {
-            log.notice("[account] AccountInfosResponse isDisconnected=true; checking independent FElibrary endpoint")
-            try await confirmAuthenticationWithLibraryEndpoint()
-            log.info("[account] FElibrary fallback confirmed authenticated session")
-        } else {
+        if !response.isDisconnected {
             // This is the primary success condition. Do not require a parsed account name or
             // handle: accounts without a YouTube channel can legitimately omit those fields.
             log.info("[account] AccountInfosResponse isDisconnected=false; authenticated session confirmed")
+            return makeAccountInfo(
+                displayName: response.name,
+                handle: response.channelHandle,
+                avatarURL: Mappers.bestThumbnailURL(response.avatar)
+            )
         }
 
-        log.info("[account] account metadata presence: name=\(response.name != nil, privacy: .public) handle=\(response.channelHandle != nil, privacy: .public) avatar=\(!response.avatar.isEmpty, privacy: .public)")
-        return AccountInfo(
-            displayName: response.name ?? "",
-            handle: response.channelHandle,
-            avatarURL: Mappers.bestThumbnailURL(response.avatar),
-            // AccountInfosResponse doesn't expose channelID directly; the library response does.
-            // Callers that need it should `fetchLibrary` and read `userChannelID` from there.
-            channelID: nil
-        )
+        log.notice("[account] AccountInfosResponse isDisconnected=true; checking raw account-menu authentication signals")
+        return try await confirmAuthenticationWithRawAccountProbe()
     }
 
     /// `AccountInfosResponse` currently defaults `isDisconnected` to true when YouTube omits the
-    /// exact `mainAppWebResponseContext.loggedOut` field. Before treating that as a definitive
-    /// rejection, confirm against a separate authenticated browse endpoint. Success still comes
-    /// from YouTube; this only avoids coupling login to one response parser shape.
-    private func confirmAuthenticationWithLibraryEndpoint() async throws {
-        let response: AccountLibraryResponse
+    /// exact `mainAppWebResponseContext.loggedOut` field. A second YouTube account-menu request is
+    /// decoded without that default, so only an explicit `loggedOut=true` becomes rejection. A
+    /// returned active-account header or `loggedOut=false` is a server-confirmed success; an
+    /// unfamiliar response remains retryable instead of being mislabeled as bad credentials.
+    private func confirmAuthenticationWithRawAccountProbe() async throws -> AccountInfo {
+        let probe: AuthenticationProbeResponse
         do {
-            response = try await AccountLibraryResponse.sendThrowingRequest(
+            probe = try await AuthenticationProbeResponse.sendThrowingRequest(
                 youtubeModel: client.model,
-                data: [:]
+                data: [:],
+                useCookies: true
             )
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            log.error("[account] FElibrary authentication fallback failed: \(String(describing: error), privacy: .public)")
+            log.error("[account] raw authentication probe failed: \(String(describing: error), privacy: .public)")
             throw YouTubeServiceError.network(error)
         }
 
-        guard !response.isDisconnected else {
-            log.notice("[account] authentication rejected: account_menu and FElibrary both report isDisconnected=true")
+        switch probe.verdict {
+        case .authenticated:
+            log.info("[account] raw account-menu probe confirmed authenticated session")
+            return makeAccountInfo(
+                displayName: probe.displayName,
+                handle: probe.channelHandle,
+                avatarURL: nil
+            )
+
+        case .rejected:
+            log.notice("[account] raw account-menu probe returned explicit loggedOut=true")
             throw YouTubeServiceError.notAuthenticated
+
+        case .indeterminate:
+            log.notice("[account] raw account-menu probe was indeterminate; keeping verification retryable")
+            throw YouTubeServiceError.network(AuthenticationProbeIndeterminateError())
         }
+    }
+
+    private func makeAccountInfo(
+        displayName: String?,
+        handle: String?,
+        avatarURL: URL?
+    ) -> AccountInfo {
+        log.info("[account] account metadata presence: name=\(displayName != nil, privacy: .public) handle=\(handle != nil, privacy: .public) avatar=\(avatarURL != nil, privacy: .public)")
+        return AccountInfo(
+            displayName: displayName ?? "",
+            handle: handle,
+            avatarURL: avatarURL,
+            // AccountInfosResponse doesn't expose channelID directly; the library response does.
+            // Callers that need it should `fetchLibrary` and read `userChannelID` from there.
+            channelID: nil
+        )
     }
 
     func fetchLibrary() async throws -> AccountLibrary {
