@@ -1,0 +1,38 @@
+name: Build FreeTube IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build FreeTube
+        run: |
+          xcodebuild \
+            -project FreeTube/FreeTube.xcodeproj \
+            -scheme FreeTube \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Make IPA
+        run: |
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/FreeTube.app Payload/
+          zip -qry FreeTube-unsigned.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: FreeTube-IPA
+          path: FreeTube-unsigned.ipa
