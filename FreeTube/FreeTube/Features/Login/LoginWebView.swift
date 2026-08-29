@@ -12,23 +12,26 @@ struct LoginWebView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
-        // **Ephemeral data store on purpose.** Reusing the shared `.default()` store made every
-        // sign-in attempt instantly "succeed" by capturing stale cookies left over in WKWebView
-        // from a previous (often half-completed) session — those cookies passed the name-set
-        // check in `CookieStore.makeHeader` but were no longer valid, so YouTubeKit's
-        // `AccountInfosResponse` came back `isDisconnected=true`. A nonPersistent store starts
-        // cookie-empty, which forces Google to show the actual sign-in form and guarantees
-        // every captured cookie comes from THIS session.
-        configuration.websiteDataStore = .nonPersistent()
+
+        // Use the persistent per-app website data store. This does NOT give FreeTube access to
+        // Safari, Gmail, or the YouTube app's cookies (iOS sandboxing prevents that), but it does
+        // let Google remember accounts that the user has already signed into inside FreeTube so
+        // later sign-ins can show Google's account chooser instead of requiring credentials again.
+        configuration.websiteDataStore = .default()
+
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = true
-        webView.load(URLRequest(url: LoginCoordinator.startURL))
+
+        Task { @MainActor in
+            await coordinator.prepareForLogin(in: webView)
+        }
+
         return webView
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
-        // No-op; the coordinator does the work.
+        // No-op; the coordinator drives navigation and verification.
     }
 
     final class Delegate: NSObject, WKNavigationDelegate {
