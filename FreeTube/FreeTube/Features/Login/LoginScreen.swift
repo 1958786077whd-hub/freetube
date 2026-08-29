@@ -18,15 +18,15 @@ struct LoginScreen: View {
                         ProgressView()
                             .tint(.white)
 
-                        Text("Finishing sign-in…")
+                        Text("正在完成登录…")
                             .font(.headline)
 
-                        Text("Checking YouTube session \(coordinator.verificationAttempt)/\(coordinator.maxVerificationAttempts)")
+                        Text("正在检查 YouTube 登录状态 \(coordinator.verificationAttempt)/\(coordinator.maxVerificationAttempts)")
                             .font(.caption)
                             .foregroundStyle(.secondary)
 
                         if !coordinator.missingCookieNames.isEmpty {
-                            Text("Waiting for: \(coordinator.missingCookieNames.joined(separator: ", "))")
+                            Text("正在等待：\(coordinator.missingCookieNames.joined(separator: ", "))")
                                 .font(.caption2)
                                 .multilineTextAlignment(.center)
                                 .foregroundStyle(.secondary)
@@ -38,15 +38,15 @@ struct LoginScreen: View {
                     .padding(.horizontal, 24)
                 }
             }
-            .navigationTitle("Sign in")
+            .navigationTitle("登录")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button("Cancel") { dismiss() }
+                    Button("取消") { dismiss() }
                 }
 
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("Change account") {
+                    Button("切换账号") {
                         coordinator.chooseAnotherAccount()
                     }
                 }
@@ -55,17 +55,17 @@ struct LoginScreen: View {
                 if case .succeeded = new { dismiss() }
             }
             .alert(
-                "Sign-in failed",
+                "登录失败",
                 isPresented: failureBinding,
                 presenting: failureMessage
             ) { _ in
-                Button("Retry") {
+                Button("重试") {
                     coordinator.retryVerification()
                 }
-                Button("Change account") {
+                Button("切换账号") {
                     coordinator.chooseAnotherAccount()
                 }
-                Button("Cancel", role: .cancel) {
+                Button("取消", role: .cancel) {
                     dismiss()
                 }
             } message: { message in
