@@ -13,10 +13,8 @@ struct LoginWebView: UIViewRepresentable {
     func makeUIView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
 
-        // Use the persistent per-app website data store. This does NOT give FreeTube access to
-        // Safari, Gmail, or the YouTube app's cookies (iOS sandboxing prevents that), but it does
-        // let Google remember accounts that the user has already signed into inside FreeTube so
-        // later sign-ins can show Google's account chooser instead of requiring credentials again.
+        // Persistent per-app storage lets Google remember accounts previously used inside FreeTube.
+        // iOS still keeps this isolated from Safari, Gmail and the YouTube app.
         configuration.websiteDataStore = .default()
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
@@ -58,10 +56,16 @@ struct LoginWebView: UIViewRepresentable {
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
             LoginWebView.log.error("[webview] didFail: \(error.localizedDescription, privacy: .public) url=\(webView.url?.absoluteString ?? "?", privacy: .public)")
+            Task { @MainActor in
+                parent.coordinator.handleWebViewFailure(error)
+            }
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
             LoginWebView.log.error("[webview] didFailProvisional: \(error.localizedDescription, privacy: .public) url=\(webView.url?.absoluteString ?? "?", privacy: .public)")
+            Task { @MainActor in
+                parent.coordinator.handleWebViewFailure(error)
+            }
         }
     }
 }
