@@ -34,7 +34,9 @@ final class AccountViewModel {
 
     func signOut() async {
         await session.signOut()
-        await LoginCoordinator.clearWebData()
+        // Remove the active YouTube web session but keep Google's account-chooser cookies so
+        // accounts previously used inside FreeTube remain available for quick re-login.
+        await LoginCoordinator.clearYouTubeWebSession()
         info = nil
     }
 }
