@@ -226,11 +226,11 @@ YouTube has been enforcing Proof-of-Origin Tokens and rotating the `n`-parameter
 
 ### Cookie de-duplication prefers `.youtube.com`
 
-Post-login, Apple's `WKHTTPCookieStore` returns identical cookies under both `.youtube.com` and `.google.com` scopes. YouTube only accepts the `.youtube.com` value. `CookieStore.dedupe` enforces that — length-based tiebreaking failed in practice (both scopes were 12 chars).
+Post-login, Apple's `WKHTTPCookieStore` can return same-name cookies under both `.youtube.com` and `.google.com` scopes. `CookieStore` prefers the value that can be sent to `www.youtube.com`; length-based tiebreaking failed in practice (both scopes were 12 chars).
 
-### Login WebView must use an ephemeral data store
+### Login WebView remembers Google accounts without reusing YouTube sessions
 
-`WKWebsiteDataStore.default()` reuses prior sessions and captures stale cookies. Login flow uses `.nonPersistent()`.
+Login uses the persistent per-app `WKWebsiteDataStore.default()` so Google's account chooser can remember accounts used in FreeTube. Before login and account switching, only YouTube-domain cookies are cleared; Google chooser state is preserved.
 
 ### `SubscriptionRegistry` reconciles YouTubeKit's gaps
 
@@ -248,11 +248,12 @@ Use `removeAllItems()` + `insert(_:after:)`. The `loadItem` helper does this cor
 
 ## Authentication
 
-1. `LoginScreen` shows a `WKWebView` against `accounts.google.com` using an **ephemeral** `WKWebsiteDataStore`.
-2. After redirect to `youtube.com`, the cookies are read, de-duplicated (prefer `.youtube.com` scope), serialized to a Cookie-header string, and stored in Keychain.
-3. `SessionManager.bootstrap()` reloads them at every app launch.
-4. Required cookies: `SAPISID`, `__Secure-3PAPISID`, `LOGIN_INFO`, `SID`, `HSID`, `SSID`, `APISID`. All must be present for `.loggedIn`.
-5. On expiry / 401: Keychain is wiped, `AuthState.loggedOut` is set, root routes to Login.
+1. `LoginScreen` shows a `WKWebView` against `accounts.google.com` using persistent per-app website storage.
+2. After redirect to `youtube.com`, cookies are polled for about 20 seconds and de-duplicated by name, preferring values that can be sent to `www.youtube.com`.
+3. Any modern authentication candidate is enough to build a complete candidate header; no fixed legacy cookie set must be complete.
+4. The candidate is applied to YouTubeKit only in memory. `AccountService.fetchAccountInfo()` and an independent authenticated library fallback let YouTube decide whether the session is signed in.
+5. A verified candidate is then stored in Keychain and changes `AuthState` to `.loggedIn`. A network error preserves the candidate for Retry without overwriting the previous Keychain login.
+6. `SessionManager.bootstrap()` reloads the last verified header at every app launch. On expiry / 401, Keychain is wiped, `AuthState.loggedOut` is set, and root routes to Login.
 
 Cookies typically last 1-2 weeks of inactivity. There is no refresh mechanism — YouTube doesn't expose one for cookie-based clients.
 

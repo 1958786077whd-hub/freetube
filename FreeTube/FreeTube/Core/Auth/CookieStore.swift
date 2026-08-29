@@ -8,16 +8,25 @@ final class CookieStore {
 
     static let keychainKey = "com.leshko.freetube.cookies"
 
-    /// CLAUDE.md §9 list. Login is only considered successful when *all* of these are present.
-    static let requiredCookieNames: Set<String> = [
+    /// Cookie names that indicate the web login has produced a plausible authenticated session.
+    /// This is deliberately a candidate list, not a required set: Google changes which members
+    /// are issued based on account, region and web client. YouTube's authenticated endpoint is the
+    /// authority that decides whether the resulting header is actually signed in.
+    static let authenticationCandidateCookieNames: Set<String> = [
         "SAPISID",
         "__Secure-3PAPISID",
-        "LOGIN_INFO",
+        "__Secure-1PAPISID",
+        "__Secure-3PSID",
+        "__Secure-1PSID",
         "SID",
-        "HSID",
-        "SSID",
         "APISID"
     ]
+
+    struct HeaderCandidate {
+        let header: String
+        let authenticationCookieNames: [String]
+        let cookieCount: Int
+    }
 
     private let log = AppLog(subsystem: "com.leshko.freetube", category: "CookieStore")
 
@@ -34,7 +43,11 @@ final class CookieStore {
 
     func loadHeader() -> String? {
         let header = KeychainHelper.string(for: Self.keychainKey)
-        log.info("[cookies] keychain read \(header == nil ? "miss" : "hit (length=\(header!.count))", privacy: .public)")
+        if let header {
+            log.info("[cookies] keychain read hit (length=\(header.count, privacy: .public))")
+        } else {
+            log.info("[cookies] keychain read miss")
+        }
         return header
     }
 
@@ -43,9 +56,10 @@ final class CookieStore {
         log.info("[cookies] keychain cleared")
     }
 
-    /// Builds a `Cookie:` header string from a list of `HTTPCookie`. Filters to YouTube/Google
-    /// cookies and **deduplicates by name**, preferring the entry with the most general domain
-    /// scope.
+    /// Builds a `Cookie:` header string from a list of `HTTPCookie` values. Missing members of a
+    /// historical fixed cookie list never block header creation. The only local gate is that at
+    /// least one modern authentication-candidate cookie exists; the YouTube service validates the
+    /// complete header afterwards.
     ///
     /// Why the dedupe matters: when the WKWebView's redirect chain visits
     /// `accounts.google.com → m.youtube.com → www.youtube.com`, YouTube sets multiple cookies
@@ -56,9 +70,11 @@ final class CookieStore {
     /// `www.youtube.com/youtubei/v1/...`. Picking the broadest-domain variant per name fixes
     /// the resulting "logged out despite valid cookies" symptom.
     func makeHeader(from cookies: [HTTPCookie]) -> String? {
-        let scoped = cookies.filter {
-            $0.domain.hasSuffix("youtube.com") || $0.domain.hasSuffix(".google.com")
-        }
+        makeHeaderCandidate(from: cookies)?.header
+    }
+
+    func makeHeaderCandidate(from cookies: [HTTPCookie]) -> HeaderCandidate? {
+        let scoped = relevantCookies(from: cookies)
 
         // Domain inventory — quick way to confirm we have cookies from `.youtube.com` (cross-
         // subdomain) and not just `m.youtube.com` or `www.youtube.com` scoped variants.
@@ -68,34 +84,12 @@ final class CookieStore {
             .joined(separator: ", ")
         log.info("[cookies] makeHeader: incoming \(cookies.count, privacy: .public) total / \(scoped.count, privacy: .public) yt+google-scoped — domains: [\(domainSummary, privacy: .public)]")
 
-        // **Preference rules** (in order of priority — first wins):
-        //   1. Prefer the YouTube-scoped cookie. The auth redirect lands on m.youtube.com which
-        //      causes YouTube to set its session cookies AND Google to set its own session
-        //      cookies under `.google.com`. We're sending the request to `www.youtube.com`, and
-        //      a real browser would only attach cookies whose domain matches that host — never
-        //      the `.google.com` variants. Picking the Google ones (as the old "shorter domain"
-        //      heuristic did when both `.youtube.com` and `.google.com` were 12 chars long)
-        //      produced "logged out" responses despite identical cookie names.
-        //   2. Among multiple YouTube-scoped variants, prefer leading-dot (`.youtube.com` over
-        //      `m.youtube.com`) since the dot version is cross-subdomain.
-        //   3. Final tiebreaker: shorter domain string.
-        func rank(_ cookie: HTTPCookie) -> (Int, Int, Int) {
-            let dom = cookie.domain
-            let ytScope: Int
-            if dom.hasSuffix("youtube.com") {
-                ytScope = 0           // best
-            } else if dom.hasSuffix("google.com") {
-                ytScope = 1           // worst — last resort
-            } else {
-                ytScope = 2
-            }
-            let dotFlag = dom.hasPrefix(".") ? 0 : 1
-            return (ytScope, dotFlag, dom.count)
-        }
         let grouped = Dictionary(grouping: scoped, by: \.name)
         var chosen: [HTTPCookie] = []
         for (name, duplicates) in grouped {
-            guard let best = duplicates.min(by: { rank($0) < rank($1) }) else { continue }
+            guard let best = duplicates.min(by: { cookieRank($0) < cookieRank($1) }) else {
+                continue
+            }
             if duplicates.count > 1 {
                 let droppedDomains = duplicates
                     .filter { $0 !== best }
@@ -107,27 +101,80 @@ final class CookieStore {
             chosen.append(best)
         }
 
-        let chosenNames = Set(chosen.map(\.name))
-        let missing = Self.requiredCookieNames.subtracting(chosenNames).sorted()
-        guard missing.isEmpty else {
-            log.notice("[cookies] makeHeader: incomplete — missing=[\(missing.joined(separator: ","), privacy: .public)]")
+        let candidateNames = Set(chosen.map(\.name))
+            .intersection(Self.authenticationCandidateCookieNames)
+            .sorted()
+        guard !candidateNames.isEmpty else {
+            log.notice("[cookies] makeHeader: waiting — no authentication-candidate cookie yet")
             return nil
         }
-        let dropped = scoped.count - chosen.count
-        let header = chosen.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
 
-        // Sanity-check the auth-critical names so we can confirm dedup didn't accidentally drop
-        // them. We log presence + the domain we kept (not the value).
-        let critical = ["SAPISID", "SID", "__Secure-1PSID", "__Secure-3PSID", "LOGIN_INFO"]
-        for name in critical {
-            if let cookie = chosen.first(where: { $0.name == name }) {
-                log.info("[cookies] kept \(name, privacy: .public) domain=\(cookie.domain, privacy: .public) length=\(cookie.value.count, privacy: .public)")
-            } else {
-                log.notice("[cookies] MISSING after dedup: \(name, privacy: .public)")
-            }
+        let dropped = scoped.count - chosen.count
+        let sortedCookies = chosen.sorted {
+            if $0.name != $1.name { return $0.name < $1.name }
+            if $0.domain != $1.domain { return $0.domain < $1.domain }
+            return $0.path < $1.path
+        }
+        let header = sortedCookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+
+        // Cookie values and the assembled header are intentionally never logged. The coordinator
+        // logs value lengths and flags only when the safe cookie inventory actually changes.
+        log.info("[cookies] makeHeader: built — kept=\(chosen.count, privacy: .public) dropped=\(dropped, privacy: .public) duplicates candidates=[\(candidateNames.joined(separator: ","), privacy: .public)]")
+        return HeaderCandidate(
+            header: header,
+            authenticationCookieNames: candidateNames,
+            cookieCount: chosen.count
+        )
+    }
+
+    func relevantCookies(from cookies: [HTTPCookie]) -> [HTTPCookie] {
+        let now = Date()
+        return cookies.filter { cookie in
+            guard !cookie.name.isEmpty, !cookie.value.isEmpty else { return false }
+            if let expiresDate = cookie.expiresDate, expiresDate <= now { return false }
+            return Self.domain(cookie.domain, belongsTo: "youtube.com")
+                || Self.domain(cookie.domain, belongsTo: "google.com")
+        }
+    }
+
+    func authenticationCandidateNames(in cookies: [HTTPCookie]) -> [String] {
+        Set(relevantCookies(from: cookies).map(\.name))
+            .intersection(Self.authenticationCandidateCookieNames)
+            .sorted()
+    }
+
+    /// Ranking is based on whether a browser could send the cookie to the exact API host first.
+    /// A Google-domain cookie is retained when it is the only value for a name, but it can never
+    /// displace a YouTube-domain value that is valid for `www.youtube.com`.
+    private func cookieRank(_ cookie: HTTPCookie) -> (Int, Int, Int, Int) {
+        let normalizedDomain = Self.normalizedDomain(cookie.domain)
+        let scopeRank: Int
+        if Self.cookie(cookie, canBeSentTo: "www.youtube.com") {
+            scopeRank = 0
+        } else if Self.domain(cookie.domain, belongsTo: "youtube.com") {
+            scopeRank = 1
+        } else {
+            scopeRank = 2
         }
 
-        log.info("[cookies] makeHeader: built — kept=\(chosen.count, privacy: .public) dropped=\(dropped, privacy: .public) duplicates, header length=\(header.count, privacy: .public)")
-        return header
+        let broadDomainRank = normalizedDomain == "youtube.com" || normalizedDomain == "google.com" ? 0 : 1
+        let broadPathRank = cookie.path == "/" ? 0 : 1
+        return (scopeRank, broadDomainRank, broadPathRank, normalizedDomain.count)
+    }
+
+    private static func cookie(_ cookie: HTTPCookie, canBeSentTo host: String) -> Bool {
+        let normalizedHost = normalizedDomain(host)
+        let normalizedCookieDomain = normalizedDomain(cookie.domain)
+        return normalizedHost == normalizedCookieDomain
+            || normalizedHost.hasSuffix(".\(normalizedCookieDomain)")
+    }
+
+    private static func domain(_ domain: String, belongsTo baseDomain: String) -> Bool {
+        let normalized = normalizedDomain(domain)
+        return normalized == baseDomain || normalized.hasSuffix(".\(baseDomain)")
+    }
+
+    private static func normalizedDomain(_ domain: String) -> String {
+        domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
     }
 }

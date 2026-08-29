@@ -46,7 +46,7 @@ These come first. Violating them breaks the project.
 | Playback | `AVFoundation` / `AVKit` (`AVQueuePlayer`, `AVPlayerViewController`, `AVPictureInPictureController`) |
 | Mini / expanded player | `LNPopupUI` |
 | Now-playing indicator | `SwimplyPlayIndicator` |
-| Login web view | `WebKit` (`WKWebView`, `WKHTTPCookieStore` against ephemeral `.nonPersistent()` data store) |
+| Login web view | `WebKit` (`WKWebView`, persistent per-app `WKWebsiteDataStore.default()` data store) |
 | Images | `Kingfisher` |
 | Secure storage | `Security` (raw Keychain via `KeychainHelper`) |
 | Persistence | `SwiftData` (`@Model`); `UserDefaults` for simple flags via `UserPreferences` |
@@ -241,14 +241,15 @@ enum PlaybackSource {
 
 ## 9. Authentication flow
 
-1. `LoginScreen` presents a `WKWebView` against an **ephemeral `.nonPersistent()` `WKWebsiteDataStore`**. The ephemeral store is critical — a persistent store reuses any prior session and we'd capture stale cookies.
-2. `LoginCoordinator` watches navigation; when the URL transitions to `youtube.com` after sign-in, it calls `WKWebsiteDataStore.default().httpCookieStore.getAllCookies` and filters for `.youtube.com` / `.google.com` domains.
-3. **Cookie de-duplication:** when both `.youtube.com` and `.google.com` versions of the same cookie are present, **prefer `.youtube.com`** (`CookieStore.dedupe`). Length-based tie-breaking failed in practice — both scopes were 12 chars. YouTube-scoped cookies are the ones YouTube actually accepts.
-4. Required cookies (all must be present): `SAPISID`, `__Secure-3PAPISID`, `LOGIN_INFO`, `SID`, `HSID`, `SSID`, `APISID`.
-5. Cookies are serialized as a single Cookie-header string and stored in Keychain under `com.leshko.freetube.cookies` via `KeychainHelper`.
-6. On every app launch, `SessionManager.bootstrap()` reads from Keychain and assigns to `YouTubeModel.shared.cookies` plus `YouTubeKitClient.shared.applyCookies(...)`.
-7. **`SubscriptionRegistry`** persists the user's subscribed channel IDs in `UserDefaults` (`com.leshko.freetube.subscriptions`). Subscribe/unsubscribe optimistically flips this **and** calls the YouTube endpoint. Needed because YouTubeKit's `subscribeStatus` parser doesn't follow `pageHeaderRenderer` entity-key indirection — channel screens were always showing "Subscribe" even on subscribed channels until this cache was added.
-8. **`AuthState`** (an `@Observable` singleton) drives root navigation: `.loggedIn` / `.loggedOut` / `.unknown`. On `cookieExpired` / 401-equivalent failures, `SessionManager.handleExpiredSession()` wipes Keychain + sets `AuthState.loggedOut` and the root re-routes to Login.
+1. `LoginScreen` presents a `WKWebView` against persistent per-app `WKWebsiteDataStore.default()` storage so Google's account chooser can remember accounts used inside FreeTube. Switching accounts clears YouTube-domain cookies while preserving Google account-chooser state.
+2. `LoginCoordinator` watches navigation; when the URL transitions to `youtube.com` after sign-in, it polls the web view's `httpCookieStore` for up to about 20 seconds and filters for `.youtube.com` / `.google.com` domains.
+3. **Cookie de-duplication:** when both `.youtube.com` and `.google.com` versions of the same cookie are present, prefer the cookie that can be sent to `www.youtube.com`. Length-based tie-breaking failed in practice — both scopes were 12 chars.
+4. There is no fixed all-or-nothing cookie set. Seeing any modern authentication candidate (`SAPISID`, `__Secure-1PAPISID`, `__Secure-3PAPISID`, `__Secure-1PSID`, `__Secure-3PSID`, `SID`, or `APISID`) is enough to construct the complete candidate header.
+5. `SessionManager.applyCandidateCookies` injects the candidate into YouTubeKit in memory. `AccountService.fetchAccountInfo()` then asks YouTube to validate it; a separate authenticated library endpoint confirms an apparent account-menu rejection before it is treated as definitive.
+6. Only after YouTube reports an authenticated response does `commitAuthenticatedSession` store the Cookie-header string in Keychain under `com.leshko.freetube.cookies` and set `AuthState.loggedIn`. Network failures keep the candidate in memory for Retry and never overwrite the existing Keychain session.
+7. On every app launch, `SessionManager.bootstrap()` reads from Keychain and assigns to `YouTubeModel.shared.cookies` plus `YouTubeKitClient.shared.applyCookies(...)`.
+8. **`SubscriptionRegistry`** persists the user's subscribed channel IDs in `UserDefaults` (`com.leshko.freetube.subscriptions`). Subscribe/unsubscribe optimistically flips this **and** calls the YouTube endpoint. Needed because YouTubeKit's `subscribeStatus` parser doesn't follow `pageHeaderRenderer` entity-key indirection — channel screens were always showing "Subscribe" even on subscribed channels until this cache was added.
+9. **`AuthState`** (an `@Observable` singleton) drives root navigation: `.loggedIn` / `.loggedOut` / `.unknown`. On `cookieExpired` / 401-equivalent failures, `SessionManager.handleExpiredSession()` wipes Keychain + sets `AuthState.loggedOut` and the root re-routes to Login.
 
 ---
 
@@ -377,13 +378,13 @@ Don't use it. Use `removeAllItems()` + `insert(_:after:)` (see `loadItem`).
 
 Stale Xcode index. Real compiler links these fine; `xcodebuild` shows `BUILD SUCCEEDED`. Ignore. Clean Build Folder clears it.
 
-### 15.7 Login `WKWebsiteDataStore` must be ephemeral
+### 15.7 Login `WKWebsiteDataStore` is persistent per app
 
-Using `.default()` reuses prior session cookies and captures stale ones. Use `.nonPersistent()`.
+Use `.default()` so Google can remember accounts previously used inside FreeTube. Before login or account switching, clear only YouTube-domain cookies; preserve Google account-chooser cookies.
 
 ### 15.8 Cookie domain de-dup picks `.youtube.com`
 
-When `.youtube.com` and `.google.com` versions of the same cookie are both present (post-login), YouTube only accepts the `.youtube.com` value. `CookieStore.dedupe` enforces this — don't simplify it to a length-based tiebreak.
+When `.youtube.com` and `.google.com` versions of the same cookie are both present after login, `CookieStore` prefers the value valid for `www.youtube.com`. Don't simplify this to a length-based tiebreak.
 
 ### 15.9 `SubscriptionRegistry` exists because YouTubeKit can't parse subscribe state reliably
 
@@ -442,7 +443,7 @@ Current state of the implementation. Items marked ✓ are shipped.
   - `PlayerStateManager`, mini player + full-screen popup (LNPopupUI)
   - Background audio + Now Playing + Remote Command Center
 - **P1 — Account** ✓
-  - Login (`WKWebView` ephemeral data store + Keychain)
+  - Login (`WKWebView` persistent per-app data store + server validation + Keychain)
   - `AccountService`, `SubscriptionService`, `HistoryService`
   - Subscriptions tab, Library tab (History / Playlists / Your videos / Subscriptions / Liked / Watch later)
   - Like / Dislike, Save-to-playlist sheet

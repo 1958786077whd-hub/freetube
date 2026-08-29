@@ -8,9 +8,16 @@ import OSLog
 final class SessionManager {
     static let shared = SessionManager()
 
+    private struct CandidateSession {
+        var header: String
+        let previousHeader: String
+        let previousStatus: AuthState.Status
+    }
+
     private let store = CookieStore.shared
     private let client = YouTubeKitClient.shared
     private let log = AppLog(subsystem: "com.leshko.freetube", category: "SessionManager")
+    private var candidateSession: CandidateSession?
 
     private init() {}
 
@@ -29,16 +36,52 @@ final class SessionManager {
         log.info("[session] bootstrap: visitor data ensured")
     }
 
-    func signIn(with header: String) async {
-        log.info("[session] signIn called — header length=\(header.count, privacy: .public)")
-        store.storeHeader(header)
+    /// Applies a newly captured header only to the in-memory YouTubeKit models. Keychain and the
+    /// global authenticated state remain untouched until server verification succeeds.
+    func applyCandidateCookies(_ header: String) {
+        if var candidateSession {
+            candidateSession.header = header
+            self.candidateSession = candidateSession
+        } else {
+            self.candidateSession = CandidateSession(
+                header: header,
+                previousHeader: client.cookies,
+                previousStatus: AuthState.shared.status
+            )
+        }
+
         client.applyCookies(header)
-        AuthState.shared.status = .loggedIn(displayName: nil)
-        log.info("[session] signIn complete → status=.loggedIn")
+        log.info("[session] candidate cookies applied in memory; persistent session unchanged")
+    }
+
+    /// Commits the candidate only after an authenticated YouTube response has been received.
+    func commitAuthenticatedSession(displayName: String?) {
+        guard let candidateSession else {
+            log.error("[session] commit requested without an in-memory candidate")
+            return
+        }
+
+        store.storeHeader(candidateSession.header)
+        client.applyCookies(candidateSession.header)
+        AuthState.shared.status = .loggedIn(displayName: displayName)
+        self.candidateSession = nil
+        log.info("[session] verified candidate committed → status=.loggedIn")
+    }
+
+    /// Restores the session that was active before candidate validation. This protects a valid
+    /// Keychain login when a new candidate is rejected, cancelled or abandoned with the sheet.
+    func discardCandidateCookies() {
+        guard let candidateSession else { return }
+
+        client.applyCookies(candidateSession.previousHeader)
+        AuthState.shared.status = candidateSession.previousStatus
+        self.candidateSession = nil
+        log.info("[session] candidate discarded; previous in-memory session restored")
     }
 
     func signOut() async {
         log.info("[session] signOut called")
+        candidateSession = nil
         store.clear()
         client.applyCookies("")
         // Drop the visitor token too — if cookies were stale, the token they were paired with may

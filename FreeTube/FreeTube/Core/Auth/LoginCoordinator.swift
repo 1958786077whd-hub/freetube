@@ -11,57 +11,127 @@ import OSLog
 @available(iOS 17.0, *)
 @MainActor
 final class LoginCoordinator: NSObject, ObservableObject {
+    enum Failure: Equatable {
+        case cookieTimeout
+        case rejected
+        case network(String)
+        case webView(String)
+        case unavailable
+
+        var title: String {
+            switch self {
+            case .cookieTimeout:
+                return "仍未获取 YouTube 登录 Cookie"
+            case .rejected:
+                return "YouTube 明确拒绝此登录会话"
+            case .network:
+                return "网络原因导致无法验证"
+            case .webView:
+                return "登录页面加载失败"
+            case .unavailable:
+                return "登录页面已经失效"
+            }
+        }
+
+        var message: String {
+            switch self {
+            case .cookieTimeout:
+                return "仍在等待 YouTube 登录 Cookie。\n\nGoogle 登录已经完成，但 WKWebView 在 20 秒内没有写入可用于验证的认证候选 Cookie。请点“重试”再次检测，或者切换账号。"
+            case .rejected:
+                return "YouTube 明确拒绝此登录会话。\n\nFreeTube 已把捕获到的 Cookie 交给 YouTube 服务端验证，但服务端仍返回未登录。请重试，或者切换另一个 Google 账号。"
+            case .network(let detail):
+                return "账号 Cookie 已获取，但暂时无法连接 YouTube 验证，请检查网络后重试。\n\n\(detail)"
+            case .webView(let detail):
+                return "Google 登录页面加载失败：\n\n\(detail)\n\n请检查网络后重试。"
+            case .unavailable:
+                return "登录页面已经失效，请关闭当前窗口后重新登录。"
+            }
+        }
+    }
+
     enum State: Equatable {
         case idle
         case loading
         case awaitingCredentials
+        case waitingForCookies
         case verifying
         case succeeded
-        case failed(String)
+        case failed(Failure)
+    }
+
+    private enum ValidationOutcome {
+        case authenticated(AccountInfo)
+        case rejected
+        case network(String)
+        case cancelled
     }
 
     @Published private(set) var state: State = .idle
-    @Published private(set) var missingCookieNames: [String] = []
+    @Published private(set) var candidateCookieNames: [String] = []
     @Published private(set) var verificationAttempt: Int = 0
 
-    let maxVerificationAttempts = 8
+    /// One immediate check plus 19 one-second waits keeps cookie polling active for about 20s.
+    let maxVerificationAttempts = 20
 
     private let log = AppLog(subsystem: "com.leshko.freetube", category: "LoginCoordinator")
+    private let cookieStore = CookieStore.shared
     private let session = SessionManager.shared
     private let accountService = AccountService()
     private weak var activeWebView: WKWebView?
     private var verificationTask: Task<Void, Never>?
+    private var candidateHeader: String?
+    private var candidateCookieCount = 0
+    private var flowGeneration = 0
+    private var isRedirectingToYouTube = false
+    private var lastCookieInventorySignature = ""
 
-    func resetState() {
-        verificationTask?.cancel()
-        verificationTask = nil
-        missingCookieNames = []
-        verificationAttempt = 0
-        state = .idle
-    }
+    static let youTubeLandingURL: URL = {
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = "www.youtube.com"
+        components.path = "/"
+        guard let url = components.url else {
+            preconditionFailure("Invalid static YouTube login URL")
+        }
+        return url
+    }()
 
     static let startURL: URL = {
-        var components = URLComponents(string: "https://accounts.google.com/AccountChooser")!
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = "accounts.google.com"
+        components.path = "/AccountChooser"
         components.queryItems = [
             URLQueryItem(name: "service", value: "youtube"),
             URLQueryItem(name: "continue", value: "https://www.youtube.com/signin?action_handle_signin=true&next=/")
         ]
-        return components.url!
+        guard let url = components.url else {
+            preconditionFailure("Invalid static Google account chooser URL")
+        }
+        return url
     }()
 
-    static let signedInHostFragment = "youtube.com"
-    static let youTubeLandingURL = URL(string: "https://www.youtube.com/")!
+    func resetState() {
+        invalidateCurrentFlow()
+        state = .idle
+    }
+
+    func cancel() {
+        invalidateCurrentFlow()
+        activeWebView = nil
+        state = .idle
+    }
 
     func prepareForLogin(in webView: WKWebView) async {
         activeWebView = webView
-        verificationTask?.cancel()
-        verificationTask = nil
-        missingCookieNames = []
-        verificationAttempt = 0
+        invalidateCurrentFlow()
+        activeWebView = webView
         state = .loading
+        let generation = flowGeneration
 
         await clearYouTubeCookies(from: webView)
 
+        guard isCurrent(generation), !Task.isCancelled else { return }
         state = .awaitingCredentials
         webView.load(URLRequest(url: Self.startURL))
     }
@@ -69,28 +139,45 @@ final class LoginCoordinator: NSObject, ObservableObject {
     func handleNavigation(to url: URL?, in webView: WKWebView) {
         activeWebView = webView
         guard let url else {
-            log.debug("[login] handleNavigation called with nil url")
+            log.debug("[login] handleNavigation called with nil URL")
             return
         }
 
-        log.info("[login] nav → host=\(url.host ?? "?", privacy: .public) path=\(url.path, privacy: .public)")
+        let host = url.host?.lowercased() ?? "?"
+        log.info("[login] navigation host=\(host, privacy: .public) path=\(url.path, privacy: .public)")
 
-        if url.host?.contains(Self.signedInHostFragment) == true {
-            if state != .succeeded {
+        if Self.host(host, belongsTo: "youtube.com") {
+            isRedirectingToYouTube = false
+            switch state {
+            case .succeeded, .failed(_):
+                return
+            default:
                 beginVerification(in: webView)
+                return
             }
-            return
         }
 
         if isPostSignInGoogleURL(url) {
-            log.info("[login] detected post-sign-in Google URL — bouncing to youtube.com to mint YT cookies")
-            state = .loading
-            webView.load(URLRequest(url: Self.youTubeLandingURL))
-            return
+            guard !isRedirectingToYouTube else { return }
+            switch state {
+            case .succeeded, .failed(_):
+                return
+            default:
+                isRedirectingToYouTube = true
+                log.info("[login] post-sign-in Google page detected; loading youtube.com to mint YouTube cookies")
+                state = .loading
+                webView.load(URLRequest(url: Self.youTubeLandingURL))
+                return
+            }
         }
 
-        if url.host?.contains("accounts.google.com") == true, state != .loading {
-            state = .awaitingCredentials
+        if Self.host(host, belongsTo: "accounts.google.com"), state != .loading {
+            switch state {
+            case .succeeded, .failed(_), .verifying, .waitingForCookies:
+                break
+            default:
+                state = .awaitingCredentials
+            }
         }
     }
 
@@ -100,86 +187,280 @@ final class LoginCoordinator: NSObject, ObservableObject {
             return
         }
 
-        verificationTask?.cancel()
-        verificationTask = nil
-        log.error("[login] web view navigation failed: \(error.localizedDescription, privacy: .public)")
-        state = .failed("Google 登录页面加载失败：\(error.localizedDescription)\n\n请检查网络后重试。")
+        log.error("[login] web view navigation failed: domain=\(nsError.domain, privacy: .public) code=\(nsError.code, privacy: .public)")
+
+        // A YouTube service verification already in flight is authoritative. A late WebKit
+        // callback must not cancel it or replace its result with a generic page-load failure.
+        guard verificationTask == nil else {
+            log.notice("[login] ignored WebKit failure while cookie/server verification is active")
+            return
+        }
+        switch state {
+        case .succeeded, .failed(_):
+            return
+        default:
+            state = .failed(.webView(error.localizedDescription))
+        }
     }
 
     func retryVerification() {
+        guard verificationTask == nil else { return }
         guard let webView = activeWebView else {
-            state = .failed("登录页面已经失效，请关闭当前窗口后重新登录。")
+            state = .failed(.unavailable)
             return
         }
 
-        verificationTask?.cancel()
-        verificationTask = nil
-        missingCookieNames = []
+        let previousState = state
+        if case .failed(.network(_)) = previousState, let candidateHeader {
+            startCandidateRetry(candidateHeader)
+            return
+        }
+
+        candidateHeader = nil
+        candidateCookieCount = 0
+        candidateCookieNames = []
         verificationAttempt = 0
+        lastCookieInventorySignature = ""
+        isRedirectingToYouTube = true
         state = .loading
-        webView.load(URLRequest(url: Self.youTubeLandingURL))
+
+        if case .failed(.webView(_)) = previousState, let currentURL = webView.url {
+            webView.load(URLRequest(url: currentURL))
+        } else {
+            webView.load(URLRequest(url: Self.youTubeLandingURL))
+        }
     }
 
     func chooseAnotherAccount() {
         guard let webView = activeWebView else {
-            state = .failed("登录页面已经失效，请关闭当前窗口后重新登录。")
+            state = .failed(.unavailable)
             return
         }
 
-        verificationTask?.cancel()
-        verificationTask = nil
-        missingCookieNames = []
-        verificationAttempt = 0
+        invalidateCurrentFlow()
+        activeWebView = webView
         state = .loading
+        let generation = flowGeneration
 
         Task { [weak self, weak webView] in
             guard let self, let webView else { return }
             await self.clearYouTubeCookies(from: webView)
-            guard self.state != .succeeded else { return }
+            guard self.isCurrent(generation), !Task.isCancelled else { return }
             self.state = .awaitingCredentials
             webView.load(URLRequest(url: Self.startURL))
         }
     }
 
     private func beginVerification(in webView: WKWebView) {
-        // WKNavigationDelegate calls us on both didCommit and didFinish for the same page.
-        // Do not cancel/restart an in-flight verifier; doing so can cancel the final account
-        // validation request at exactly the wrong moment and surface a false login failure.
-        if state == .verifying, verificationTask != nil {
+        // `didCommit` and `didFinish` both arrive for the same navigation. There is exactly one
+        // task for the full cookie-polling + server-verification lifecycle.
+        guard verificationTask == nil else {
+            log.debug("[login] navigation callback ignored; verification task already active")
             return
         }
 
-        verificationTask?.cancel()
-        missingCookieNames = []
+        candidateCookieNames = []
         verificationAttempt = 0
-        state = .verifying
+        state = .waitingForCookies
+        let generation = flowGeneration
 
         verificationTask = Task { [weak self, weak webView] in
             guard let self, let webView else { return }
+            await self.pollForCookiesAndVerify(in: webView, generation: generation)
+        }
+    }
 
-            for attempt in 1...self.maxVerificationAttempts {
-                guard !Task.isCancelled else { return }
-                self.verificationAttempt = attempt
+    private func pollForCookiesAndVerify(in webView: WKWebView, generation: Int) async {
+        var lastRejectedHeader: String?
+        var receivedExplicitRejection = false
 
-                if await self.captureCookies(from: webView) {
-                    self.verificationTask = nil
-                    return
-                }
+        for attempt in 1...maxVerificationAttempts {
+            guard isCurrent(generation), !Task.isCancelled else { return }
+            verificationAttempt = attempt
 
-                if attempt < self.maxVerificationAttempts {
-                    try? await Task.sleep(for: .milliseconds(1500))
-                }
+            let cookies = await webView.configuration.websiteDataStore.httpCookieStore.allCookies()
+            guard isCurrent(generation), !Task.isCancelled else { return }
+
+            logCookieInventoryIfChanged(cookies)
+
+            guard let candidate = cookieStore.makeHeaderCandidate(from: cookies) else {
+                candidateCookieNames = cookieStore.authenticationCandidateNames(in: cookies)
+                state = .waitingForCookies
+                await waitBeforeNextCookieCheck(attempt: attempt)
+                continue
             }
 
-            guard !Task.isCancelled else { return }
-            let missing = self.missingCookieNames.isEmpty
-                ? "未知会话 Cookie"
-                : self.missingCookieNames.joined(separator: ", ")
+            candidateCookieCount = candidate.cookieCount
+            candidateCookieNames = candidate.authenticationCookieNames
 
-            self.verificationTask = nil
-            self.state = .failed(
-                "Google 登录已经完成，但 FreeTube 没有获取到完整的 YouTube 登录 Cookie。\n\n缺少：\(missing)\n\n你可以重试检测，或者切换另一个 Google 账号。"
+            // A rejected header is retried only if WebKit has actually written a different
+            // candidate. This gives asynchronous cookie writes the full polling window without
+            // hammering the account endpoint with an identical rejected request every second.
+            guard candidate.header != lastRejectedHeader else {
+                state = .waitingForCookies
+                await waitBeforeNextCookieCheck(attempt: attempt)
+                continue
+            }
+
+            candidateHeader = candidate.header
+            let outcome = await validate(candidate, generation: generation)
+            guard isCurrent(generation), !Task.isCancelled else { return }
+
+            switch outcome {
+            case .authenticated(let accountInfo):
+                commit(accountInfo, generation: generation)
+                return
+
+            case .rejected:
+                receivedExplicitRejection = true
+                lastRejectedHeader = candidate.header
+                candidateHeader = nil
+                candidateCookieCount = 0
+                session.discardCandidateCookies()
+                log.notice("[login] server result: isDisconnected=true; waiting for any later WebKit cookie update")
+                state = .waitingForCookies
+
+            case .network(let detail):
+                // Keep both the in-memory candidate and the coordinator's private copy so Retry
+                // can repeat only the server validation without asking for the Google password.
+                state = .failed(.network(detail))
+                finishVerificationTask(generation: generation)
+                return
+
+            case .cancelled:
+                return
+            }
+
+            await waitBeforeNextCookieCheck(attempt: attempt)
+        }
+
+        guard isCurrent(generation), !Task.isCancelled else { return }
+        candidateHeader = nil
+        candidateCookieCount = 0
+        session.discardCandidateCookies()
+        state = .failed(receivedExplicitRejection ? .rejected : .cookieTimeout)
+        finishVerificationTask(generation: generation)
+    }
+
+    private func validate(
+        _ candidate: CookieStore.HeaderCandidate,
+        generation: Int
+    ) async -> ValidationOutcome {
+        guard isCurrent(generation), !Task.isCancelled else { return .cancelled }
+
+        state = .verifying
+        session.applyCandidateCookies(candidate.header)
+        log.info("[login] validating candidate with YouTube: cookies=\(candidate.cookieCount, privacy: .public) authNames=[\(candidate.authenticationCookieNames.joined(separator: ","), privacy: .public)]")
+
+        do {
+            let accountInfo = try await accountService.fetchAccountInfo()
+            guard isCurrent(generation), !Task.isCancelled else { return .cancelled }
+            log.info("[login] server result: authenticated=true isDisconnected=false")
+            return .authenticated(accountInfo)
+        } catch is CancellationError {
+            return .cancelled
+        } catch YouTubeServiceError.notAuthenticated {
+            guard isCurrent(generation), !Task.isCancelled else { return .cancelled }
+            log.notice("[login] server result: authenticated=false isDisconnected=true")
+            return .rejected
+        } catch {
+            guard isCurrent(generation), !Task.isCancelled else { return .cancelled }
+            log.error("[login] server validation unavailable: \(String(describing: error), privacy: .public)")
+            return .network(error.localizedDescription)
+        }
+    }
+
+    private func startCandidateRetry(_ header: String) {
+        guard verificationTask == nil else { return }
+        let generation = flowGeneration
+        state = .verifying
+
+        verificationTask = Task { [weak self] in
+            guard let self else { return }
+            let candidate = CookieStore.HeaderCandidate(
+                header: header,
+                authenticationCookieNames: self.candidateCookieNames,
+                cookieCount: self.candidateCookieCount
             )
+            let outcome = await self.validate(candidate, generation: generation)
+            guard self.isCurrent(generation), !Task.isCancelled else { return }
+
+            switch outcome {
+            case .authenticated(let accountInfo):
+                self.commit(accountInfo, generation: generation)
+
+            case .rejected:
+                self.candidateHeader = nil
+                self.candidateCookieCount = 0
+                self.session.discardCandidateCookies()
+                self.state = .failed(.rejected)
+                self.finishVerificationTask(generation: generation)
+
+            case .network(let detail):
+                self.state = .failed(.network(detail))
+                self.finishVerificationTask(generation: generation)
+
+            case .cancelled:
+                break
+            }
+        }
+    }
+
+    private func commit(_ accountInfo: AccountInfo, generation: Int) {
+        guard isCurrent(generation) else { return }
+        let trimmedName = accountInfo.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        session.commitAuthenticatedSession(displayName: trimmedName.isEmpty ? nil : trimmedName)
+        candidateHeader = nil
+        candidateCookieCount = 0
+        state = .succeeded
+        log.info("[login] verified candidate committed; state=succeeded")
+        finishVerificationTask(generation: generation)
+    }
+
+    private func waitBeforeNextCookieCheck(attempt: Int) async {
+        guard attempt < maxVerificationAttempts else { return }
+        try? await Task.sleep(for: .seconds(1))
+    }
+
+    private func finishVerificationTask(generation: Int) {
+        guard isCurrent(generation) else { return }
+        verificationTask = nil
+    }
+
+    private func invalidateCurrentFlow() {
+        flowGeneration += 1
+        verificationTask?.cancel()
+        verificationTask = nil
+        session.discardCandidateCookies()
+        candidateHeader = nil
+        candidateCookieCount = 0
+        candidateCookieNames = []
+        verificationAttempt = 0
+        isRedirectingToYouTube = false
+        lastCookieInventorySignature = ""
+    }
+
+    private func isCurrent(_ generation: Int) -> Bool {
+        flowGeneration == generation
+    }
+
+    private func logCookieInventoryIfChanged(_ cookies: [HTTPCookie]) {
+        let relevant = cookieStore.relevantCookies(from: cookies).sorted {
+            if $0.name != $1.name { return $0.name < $1.name }
+            if $0.domain != $1.domain { return $0.domain < $1.domain }
+            return $0.path < $1.path
+        }
+        let candidateNames = cookieStore.authenticationCandidateNames(in: relevant)
+        let signature = relevant.map {
+            "\($0.name)|\($0.domain)|\($0.path)|\($0.isSecure)|\($0.isHTTPOnly)|\($0.value.count)"
+        }.joined(separator: ";")
+
+        guard signature != lastCookieInventorySignature else { return }
+        lastCookieInventorySignature = signature
+
+        log.info("[login] cookie inventory changed: all=\(cookies.count, privacy: .public) relevant=\(relevant.count, privacy: .public) authNames=[\(candidateNames.joined(separator: ","), privacy: .public)]")
+        for cookie in relevant {
+            log.info("[login] cookie name=\(cookie.name, privacy: .public) domain=\(cookie.domain, privacy: .public) path=\(cookie.path, privacy: .public) secure=\(cookie.isSecure, privacy: .public) httpOnly=\(cookie.isHTTPOnly, privacy: .public) valueLength=\(cookie.value.count, privacy: .public)")
         }
     }
 
@@ -188,75 +469,19 @@ final class LoginCoordinator: NSObject, ObservableObject {
         if host == "myaccount.google.com" { return true }
         if host == "accounts.google.com" {
             let path = url.path.lowercased()
-            return path.contains("manageaccount") || path.contains("checkcookie") || path.contains("/b/")
+            return path.contains("manageaccount")
+                || path.contains("checkcookie")
+                || path.contains("/b/")
         }
         return false
-    }
-
-    /// Returns true when verification should stop: either YouTube confirmed the account or a
-    /// definitive validation error was shown to the user.
-    private func captureCookies(from webView: WKWebView) async -> Bool {
-        let cookies = await webView.configuration.websiteDataStore.httpCookieStore.allCookies()
-        let ytCookies = cookies.filter {
-            $0.domain.hasSuffix("youtube.com") || $0.domain.hasSuffix("google.com")
-        }
-        let presentNames = Set(ytCookies.map(\.name))
-        let missingNames = CookieStore.requiredCookieNames.subtracting(presentNames).sorted()
-        missingCookieNames = missingNames
-        let missing = missingNames.joined(separator: ",")
-
-        let byName = Dictionary(grouping: ytCookies, by: \.name)
-        let duplicateNames = byName.filter { $0.value.count > 1 }
-        let duplicateSummary = duplicateNames
-            .map { "\($0.key)×\($0.value.count)" }
-            .sorted()
-            .joined(separator: ",")
-        let domainSet = Set(ytCookies.map(\.domain)).sorted().joined(separator: ",")
-
-        log.info("[login] captureCookies: total=\(cookies.count, privacy: .public) ytScoped=\(ytCookies.count, privacy: .public) presentRequired=\(CookieStore.requiredCookieNames.intersection(presentNames).count, privacy: .public)/\(CookieStore.requiredCookieNames.count, privacy: .public) missing=[\(missing, privacy: .public)] uniqueNames=\(byName.count, privacy: .public)")
-        log.info("[login] captureCookies domains: [\(domainSet, privacy: .public)]")
-        if !duplicateNames.isEmpty {
-            log.info("[login] captureCookies duplicates (will be deduped): [\(duplicateSummary, privacy: .public)]")
-        }
-
-        guard let header = CookieStore.shared.makeHeader(from: cookies) else {
-            log.notice("[login] required cookie set incomplete — retrying automatically")
-            return false
-        }
-
-        guard !Task.isCancelled else { return true }
-
-        log.info("[login] required cookies present, applying session and validating with YouTube")
-        await session.signIn(with: header)
-        missingCookieNames = []
-
-        do {
-            _ = try await accountService.fetchAccountInfo()
-            guard !Task.isCancelled else { return true }
-            state = .succeeded
-            log.info("[login] account validation succeeded — state=.succeeded")
-            return true
-        } catch is CancellationError {
-            log.debug("[login] account validation cancelled because login flow changed")
-            return true
-        } catch YouTubeServiceError.notAuthenticated {
-            guard !Task.isCancelled else { return true }
-            log.notice("[login] cookie names were complete but YouTube rejected the session")
-            await session.signOut()
-            state = .failed("Cookie 已获取完整，但 YouTube 没有接受这个登录会话。\n\n请点“切换账号”重新登录。")
-            return true
-        } catch {
-            guard !Task.isCancelled else { return true }
-            log.error("[login] account validation request failed: \(String(describing: error), privacy: .public)")
-            state = .failed("登录 Cookie 已获取，但验证账号时网络请求失败：\n\n\(error.localizedDescription)\n\n请检查网络后点“重试”。")
-            return true
-        }
     }
 
     private func clearYouTubeCookies(from webView: WKWebView) async {
         let store = webView.configuration.websiteDataStore.httpCookieStore
         let cookies = await store.allCookies()
-        let staleYouTubeCookies = cookies.filter { $0.domain.hasSuffix("youtube.com") }
+        let staleYouTubeCookies = cookies.filter {
+            Self.host($0.domain, belongsTo: "youtube.com")
+        }
 
         guard !staleYouTubeCookies.isEmpty else {
             log.info("[login] no stale YouTube cookies to clear before sign-in")
@@ -272,7 +497,7 @@ final class LoginCoordinator: NSObject, ObservableObject {
     static func clearYouTubeWebSession() async {
         let store = WKWebsiteDataStore.default().httpCookieStore
         let cookies = await store.allCookies()
-        for cookie in cookies where cookie.domain.hasSuffix("youtube.com") {
+        for cookie in cookies where host(cookie.domain, belongsTo: "youtube.com") {
             await store.delete(cookie)
         }
     }
@@ -287,5 +512,10 @@ final class LoginCoordinator: NSObject, ObservableObject {
         ]
         await WKWebsiteDataStore.default()
             .removeData(ofTypes: types, modifiedSince: .distantPast)
+    }
+
+    private static func host(_ host: String, belongsTo baseDomain: String) -> Bool {
+        let normalized = host.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        return normalized == baseDomain || normalized.hasSuffix(".\(baseDomain)")
     }
 }

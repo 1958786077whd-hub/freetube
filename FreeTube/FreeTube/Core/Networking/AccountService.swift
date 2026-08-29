@@ -31,7 +31,7 @@ protocol AccountServicing: Sendable {
 }
 
 /// Wraps YouTubeKit's authenticated `Account*Response` types. All three require cookies on
-/// `YouTubeModel`; `SessionManager.bootstrap` / `signIn` is responsible for applying them.
+/// `YouTubeModel`; `SessionManager.bootstrap` / `applyCandidateCookies` is responsible for applying them.
 /// Each method throws `YouTubeServiceError.notAuthenticated` when YouTubeKit reports
 /// `isDisconnected == true` (no valid session) so the UI can route to the login screen.
 final class AccountService: AccountServicing {
@@ -50,15 +50,24 @@ final class AccountService: AccountServicing {
                 youtubeModel: client.model,
                 data: [:]
             )
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             log.error("[account] AccountInfosResponse failed: \(String(describing: error), privacy: .public)")
             throw YouTubeServiceError.network(error)
         }
-        guard !response.isDisconnected else {
-            log.notice("[account] AccountInfosResponse isDisconnected=true (YouTube says logged out) — has name=\(response.name != nil, privacy: .public) handle=\(response.channelHandle != nil, privacy: .public)")
-            throw YouTubeServiceError.notAuthenticated
+
+        if response.isDisconnected {
+            log.notice("[account] AccountInfosResponse isDisconnected=true; checking independent FElibrary endpoint")
+            try await confirmAuthenticationWithLibraryEndpoint()
+            log.info("[account] FElibrary fallback confirmed authenticated session")
+        } else {
+            // This is the primary success condition. Do not require a parsed account name or
+            // handle: accounts without a YouTube channel can legitimately omit those fields.
+            log.info("[account] AccountInfosResponse isDisconnected=false; authenticated session confirmed")
         }
-        log.info("[account] AccountInfosResponse OK: name=\(response.name ?? "?", privacy: .public) handle=\(response.channelHandle ?? "?", privacy: .public)")
+
+        log.info("[account] account metadata presence: name=\(response.name != nil, privacy: .public) handle=\(response.channelHandle != nil, privacy: .public) avatar=\(!response.avatar.isEmpty, privacy: .public)")
         return AccountInfo(
             displayName: response.name ?? "",
             handle: response.channelHandle,
@@ -67,6 +76,30 @@ final class AccountService: AccountServicing {
             // Callers that need it should `fetchLibrary` and read `userChannelID` from there.
             channelID: nil
         )
+    }
+
+    /// `AccountInfosResponse` currently defaults `isDisconnected` to true when YouTube omits the
+    /// exact `mainAppWebResponseContext.loggedOut` field. Before treating that as a definitive
+    /// rejection, confirm against a separate authenticated browse endpoint. Success still comes
+    /// from YouTube; this only avoids coupling login to one response parser shape.
+    private func confirmAuthenticationWithLibraryEndpoint() async throws {
+        let response: AccountLibraryResponse
+        do {
+            response = try await AccountLibraryResponse.sendThrowingRequest(
+                youtubeModel: client.model,
+                data: [:]
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            log.error("[account] FElibrary authentication fallback failed: \(String(describing: error), privacy: .public)")
+            throw YouTubeServiceError.network(error)
+        }
+
+        guard !response.isDisconnected else {
+            log.notice("[account] authentication rejected: account_menu and FElibrary both report isDisconnected=true")
+            throw YouTubeServiceError.notAuthenticated
+        }
     }
 
     func fetchLibrary() async throws -> AccountLibrary {

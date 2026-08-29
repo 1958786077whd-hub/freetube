@@ -8,6 +8,11 @@ struct LoginWebView: UIViewRepresentable {
 
     private static let log = AppLog(subsystem: "com.leshko.freetube", category: "LoginWebView")
 
+    private static func safeNavigationDescription(_ url: URL?) -> String {
+        guard let url else { return "host=? path=?" }
+        return "host=\(url.host ?? "?") path=\(url.path)"
+    }
+
     func makeCoordinator() -> Delegate { Delegate(parent: self) }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -37,32 +42,34 @@ struct LoginWebView: UIViewRepresentable {
         init(parent: LoginWebView) { self.parent = parent }
 
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
-            LoginWebView.log.debug("[webview] didStart: \(webView.url?.absoluteString ?? "?", privacy: .public)")
+            LoginWebView.log.debug("[webview] didStart: \(LoginWebView.safeNavigationDescription(webView.url), privacy: .public)")
         }
 
         func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-            LoginWebView.log.debug("[webview] didCommit: \(webView.url?.absoluteString ?? "?", privacy: .public)")
+            LoginWebView.log.debug("[webview] didCommit: \(LoginWebView.safeNavigationDescription(webView.url), privacy: .public)")
             Task { @MainActor in
                 parent.coordinator.handleNavigation(to: webView.url, in: webView)
             }
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            LoginWebView.log.debug("[webview] didFinish: \(webView.url?.absoluteString ?? "?", privacy: .public)")
+            LoginWebView.log.debug("[webview] didFinish: \(LoginWebView.safeNavigationDescription(webView.url), privacy: .public)")
             Task { @MainActor in
                 parent.coordinator.handleNavigation(to: webView.url, in: webView)
             }
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-            LoginWebView.log.error("[webview] didFail: \(error.localizedDescription, privacy: .public) url=\(webView.url?.absoluteString ?? "?", privacy: .public)")
+            let nsError = error as NSError
+            LoginWebView.log.error("[webview] didFail: domain=\(nsError.domain, privacy: .public) code=\(nsError.code, privacy: .public) \(LoginWebView.safeNavigationDescription(webView.url), privacy: .public)")
             Task { @MainActor in
                 parent.coordinator.handleWebViewFailure(error)
             }
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-            LoginWebView.log.error("[webview] didFailProvisional: \(error.localizedDescription, privacy: .public) url=\(webView.url?.absoluteString ?? "?", privacy: .public)")
+            let nsError = error as NSError
+            LoginWebView.log.error("[webview] didFailProvisional: domain=\(nsError.domain, privacy: .public) code=\(nsError.code, privacy: .public) \(LoginWebView.safeNavigationDescription(webView.url), privacy: .public)")
             Task { @MainActor in
                 parent.coordinator.handleWebViewFailure(error)
             }
