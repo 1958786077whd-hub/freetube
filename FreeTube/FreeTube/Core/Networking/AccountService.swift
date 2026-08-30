@@ -74,6 +74,20 @@ private struct AuthenticationProbeIndeterminateError: LocalizedError, Sendable {
     }
 }
 
+private struct AuthenticationWebProbeHTTPError: LocalizedError, Sendable {
+    let statusCode: Int
+
+    var errorDescription: String? {
+        "YouTube 网页验证返回 HTTP \(statusCode)。"
+    }
+}
+
+private enum AuthenticationWebVerdict: Sendable {
+    case authenticated
+    case rejected
+    case indeterminate
+}
+
 struct AccountInfo: Sendable {
     let displayName: String
     let handle: String?
@@ -111,22 +125,150 @@ final class AccountService: AccountServicing {
     private let client: YouTubeKitClient
     private let log = AppLog(subsystem: "com.leshko.freetube", category: "AccountService")
 
+    private static let authenticationWebProbeURL: URL = {
+        guard let url = URL(string: "https://www.youtube.com/?app=desktop&persist_app=1") else {
+            preconditionFailure("Invalid static YouTube authentication probe URL")
+        }
+        return url
+    }()
+
+    private static let authenticationWebUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
+
     nonisolated init(client: YouTubeKitClient = .shared) {
         self.client = client
     }
 
     func fetchAccountInfo() async throws -> AccountInfo {
         log.info("[account] fetchAccountInfo — model.cookies length=\(self.client.model.cookies.count, privacy: .public) alwaysUseCookies=\(self.client.model.alwaysUseCookies, privacy: .public)")
-        let response: AccountInfosResponse
+
+        let webVerdict: AuthenticationWebVerdict?
+        let webProbeError: Error?
         do {
-            response = try await AccountInfosResponse.sendThrowingRequest(
-                youtubeModel: client.model,
-                data: [:]
-            )
+            webVerdict = try await probeYouTubeWebSession()
+            webProbeError = nil
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            log.error("[account] AccountInfosResponse failed: \(String(describing: error), privacy: .public)")
+            webVerdict = nil
+            webProbeError = error
+            log.error("[account] YouTube web-session probe unavailable: \(String(describing: error), privacy: .public)")
+        }
+
+        switch webVerdict {
+        case .authenticated:
+            // `LOGGED_IN=true` comes from a fresh YouTube HTML response to this exact Cookie
+            // header. It is a server result, not a local cookie-name heuristic. AccountInfos is
+            // now best-effort metadata only, because its pinned InnerTube client can be rejected
+            // independently of an otherwise valid browser session.
+            log.info("[account] server result: YouTube web LOGGED_IN=true")
+            return try await fetchMetadataForConfirmedWebSession()
+
+        case .rejected:
+            log.notice("[account] server result: YouTube web LOGGED_IN=false")
+            throw YouTubeServiceError.notAuthenticated
+
+        case .indeterminate, .none:
+            log.notice("[account] YouTube web-session result indeterminate; falling back to authenticated API probes")
+        }
+
+        do {
+            return try await fetchAccountInfoFromYouTubeKit()
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as YouTubeServiceError {
+            throw error
+        } catch {
+            throw YouTubeServiceError.network(webProbeError ?? error)
+        }
+    }
+
+    /// Fetches a fresh YouTube page with the exact candidate header. YouTube emits `LOGGED_IN`
+    /// in its server-generated configuration for both authenticated and anonymous responses.
+    /// This avoids coupling login correctness to YouTubeKit's dated InnerTube client version while
+    /// still requiring a positive response from YouTube itself.
+    private func probeYouTubeWebSession() async throws -> AuthenticationWebVerdict {
+        let cookies = client.cookies
+        guard !cookies.isEmpty else { return .rejected }
+
+        var request = URLRequest(
+            url: Self.authenticationWebProbeURL,
+            cachePolicy: .reloadIgnoringLocalAndRemoteCacheData,
+            timeoutInterval: 20
+        )
+        request.httpMethod = "GET"
+        request.setValue(cookies, forHTTPHeaderField: "Cookie")
+        request.setValue(Self.authenticationWebUserAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
+        request.setValue("zh-CN,zh-Hans;q=0.9,en;q=0.8", forHTTPHeaderField: "Accept-Language")
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        request.setValue("no-cache", forHTTPHeaderField: "Pragma")
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpShouldSetCookies = false
+        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        configuration.urlCache = nil
+        let session = URLSession(configuration: configuration)
+        defer { session.finishTasksAndInvalidate() }
+
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            return .indeterminate
+        }
+        guard (200..<400).contains(httpResponse.statusCode) else {
+            throw AuthenticationWebProbeHTTPError(statusCode: httpResponse.statusCode)
+        }
+
+        guard let html = String(data: data, encoding: .utf8) else {
+            return .indeterminate
+        }
+
+        let loggedInTrue = html.range(
+            of: #""LOGGED_IN"\s*:\s*true"#,
+            options: .regularExpression
+        ) != nil
+        let loggedInFalse = html.range(
+            of: #""LOGGED_IN"\s*:\s*false"#,
+            options: .regularExpression
+        ) != nil
+
+        if loggedInTrue { return .authenticated }
+        if loggedInFalse { return .rejected }
+        return .indeterminate
+    }
+
+    /// Once the web endpoint has authenticated the exact cookie header, an AccountInfos failure
+    /// cannot turn that success into a false network error. We still call it to populate account
+    /// metadata when the pinned YouTubeKit request remains compatible.
+    private func fetchMetadataForConfirmedWebSession() async throws -> AccountInfo {
+        do {
+            let response = try await requestAccountInfos()
+            if !response.isDisconnected {
+                log.info("[account] AccountInfos metadata request succeeded after web authentication")
+                return makeAccountInfo(
+                    displayName: response.name,
+                    handle: response.channelHandle,
+                    avatarURL: Mappers.bestThumbnailURL(response.avatar)
+                )
+            }
+
+            log.notice("[account] AccountInfos metadata parser reported disconnected after web authentication; ignoring parser false negative")
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            logYouTubeKitFailure("AccountInfos metadata request", error: error)
+        }
+
+        return makeAccountInfo(displayName: nil, handle: nil, avatarURL: nil)
+    }
+
+    private func fetchAccountInfoFromYouTubeKit() async throws -> AccountInfo {
+        let response: AccountInfosResponse
+        do {
+            response = try await requestAccountInfos()
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            logYouTubeKitFailure("AccountInfosResponse", error: error)
             throw YouTubeServiceError.network(error)
         }
 
@@ -143,6 +285,13 @@ final class AccountService: AccountServicing {
 
         log.notice("[account] AccountInfosResponse isDisconnected=true; checking raw account-menu authentication signals")
         return try await confirmAuthenticationWithRawAccountProbe()
+    }
+
+    private func requestAccountInfos() async throws -> AccountInfosResponse {
+        try await AccountInfosResponse.sendThrowingRequest(
+            youtubeModel: client.model,
+            data: [:]
+        )
     }
 
     /// `AccountInfosResponse` currently defaults `isDisconnected` to true when YouTube omits the
@@ -181,6 +330,14 @@ final class AccountService: AccountServicing {
         case .indeterminate:
             log.notice("[account] raw account-menu probe was indeterminate; keeping verification retryable")
             throw YouTubeServiceError.network(AuthenticationProbeIndeterminateError())
+        }
+    }
+
+    private func logYouTubeKitFailure(_ operation: String, error: Error) {
+        if let networkError = error as? NetworkError {
+            log.error("[account] \(operation, privacy: .public) rejected by YouTube API: code=\(networkError.code, privacy: .public) message=\(networkError.message, privacy: .public)")
+        } else {
+            log.error("[account] \(operation, privacy: .public) failed: type=\(String(describing: type(of: error)), privacy: .public) description=\(error.localizedDescription, privacy: .public)")
         }
     }
 

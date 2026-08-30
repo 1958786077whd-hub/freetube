@@ -251,7 +251,7 @@ Use `removeAllItems()` + `insert(_:after:)`. The `loadItem` helper does this cor
 1. `LoginScreen` shows a `WKWebView` against `accounts.google.com` using persistent per-app website storage.
 2. After redirect to `youtube.com`, cookies are polled for about 20 seconds and de-duplicated by name, preferring values that can be sent to `www.youtube.com`.
 3. Any modern authentication candidate is enough to build a complete candidate header; no fixed legacy cookie set must be complete.
-4. The candidate is applied to YouTubeKit only in memory. `AccountService.fetchAccountInfo()` lets YouTube decide whether the session is signed in; a raw account-menu probe prevents YouTubeKit's missing-`loggedOut` default from becoming a false rejection.
+4. The candidate is applied only in memory. `AccountService.fetchAccountInfo()` sends the exact header to a fresh YouTube page and accepts only its server-generated `LOGGED_IN=true`; YouTubeKit then supplies account metadata on a best-effort basis so a stale InnerTube client cannot mislabel a valid session as a network failure.
 5. A verified candidate is then stored in Keychain and changes `AuthState` to `.loggedIn`. A network error preserves the candidate for Retry without overwriting the previous Keychain login.
 6. `SessionManager.bootstrap()` reloads the last verified header at every app launch. On expiry / 401, Keychain is wiped, `AuthState.loggedOut` is set, and root routes to Login.
 
