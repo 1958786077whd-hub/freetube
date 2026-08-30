@@ -1,6 +1,9 @@
 name: Build FreeTube IPA
 
 on:
+  push:
+    branches:
+      - codex/build-ipa-7c6105d
   workflow_dispatch:
 
 jobs:
