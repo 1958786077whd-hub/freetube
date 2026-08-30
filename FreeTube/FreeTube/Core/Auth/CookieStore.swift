@@ -58,8 +58,10 @@ final class CookieStore {
 
     /// Builds a `Cookie:` header string from a list of `HTTPCookie` values. Missing members of a
     /// historical fixed cookie list never block header creation. The only local gate is that at
-    /// least one modern authentication-candidate cookie exists; the YouTube service validates the
-    /// complete header afterwards.
+    /// least one modern authentication-candidate cookie can actually be sent to `www.youtube.com`;
+    /// Google-only `SID`/`APISID` values are retained in the complete header but cannot start
+    /// verification before YouTube has minted its own session cookies. The YouTube service then
+    /// validates the complete header.
     ///
     /// Why the dedupe matters: when the WKWebView's redirect chain visits
     /// `accounts.google.com → m.youtube.com → www.youtube.com`, YouTube sets multiple cookies
@@ -101,11 +103,19 @@ final class CookieStore {
             chosen.append(best)
         }
 
-        let candidateNames = Set(chosen.map(\.name))
+        let candidateNames = Set(chosen.filter {
+            Self.domain($0.domain, belongsTo: "youtube.com")
+                && Self.cookie($0, canBeSentTo: "www.youtube.com")
+        }.map(\.name))
             .intersection(Self.authenticationCandidateCookieNames)
             .sorted()
         guard !candidateNames.isEmpty else {
-            log.notice("[cookies] makeHeader: waiting — no authentication-candidate cookie yet")
+            let googleOnlyCandidateNames = Set(chosen.filter {
+                Self.domain($0.domain, belongsTo: "google.com")
+            }.map(\.name))
+                .intersection(Self.authenticationCandidateCookieNames)
+                .sorted()
+            log.notice("[cookies] makeHeader: waiting — no YouTube-sendable authentication cookie yet; googleOnly=[\(googleOnlyCandidateNames.joined(separator: ","), privacy: .public)]")
             return nil
         }
 

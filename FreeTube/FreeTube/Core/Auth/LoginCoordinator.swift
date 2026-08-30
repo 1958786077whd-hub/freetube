@@ -96,7 +96,29 @@ final class LoginCoordinator: NSObject, ObservableObject {
         return url
     }()
 
+    /// Mirrors the working Google → YouTube hand-off used by the reference project. Starting at
+    /// `ServiceLogin` with `service=youtube` makes Google finish at YouTube's sign-in endpoint so
+    /// YouTube, rather than only Google AccountChooser, mints the final `.youtube.com` cookies.
     static let startURL: URL = {
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = "accounts.google.com"
+        components.path = "/ServiceLogin"
+        components.queryItems = [
+            URLQueryItem(name: "service", value: "youtube"),
+            URLQueryItem(name: "uilel", value: "3"),
+            URLQueryItem(name: "passive", value: "true"),
+            URLQueryItem(name: "continue", value: "https://www.youtube.com/signin?action_handle_signin=true&next=/")
+        ]
+        guard let url = components.url else {
+            preconditionFailure("Invalid static Google YouTube sign-in URL")
+        }
+        return url
+    }()
+
+    /// Switching accounts deliberately returns to AccountChooser while preserving Google's
+    /// persistent account list. Only YouTube-domain cookies are cleared before this URL is loaded.
+    static let accountChooserURL: URL = {
         var components = URLComponents()
         components.scheme = "https"
         components.host = "accounts.google.com"
@@ -247,7 +269,7 @@ final class LoginCoordinator: NSObject, ObservableObject {
             await self.clearYouTubeCookies(from: webView)
             guard self.isCurrent(generation), !Task.isCancelled else { return }
             self.state = .awaitingCredentials
-            webView.load(URLRequest(url: Self.startURL))
+            webView.load(URLRequest(url: Self.accountChooserURL))
         }
     }
 
