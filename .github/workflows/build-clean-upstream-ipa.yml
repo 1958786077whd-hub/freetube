@@ -1,0 +1,48 @@
+name: Build clean upstream FreeTube IPA
+
+on:
+  push:
+    branches:
+      - build-upstream-clean-20260831
+
+jobs:
+  build:
+    runs-on: macos-26
+
+    steps:
+      - name: Checkout exact source branch
+        uses: actions/checkout@v5
+
+      - name: Select Xcode 26.6
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+
+      - name: Build FreeTube
+        run: |
+          xcodebuild \
+            -project FreeTube/FreeTube.xcodeproj \
+            -scheme FreeTube \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package IPA
+        run: |
+          rm -rf Payload
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/FreeTube.app Payload/
+          ditto -c -k --sequesterRsrc --keepParent Payload FreeTube-upstream-unsigned.ipa
+          unzip -t FreeTube-upstream-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: FreeTube-upstream-IPA
+          path: FreeTube-upstream-unsigned.ipa
+          if-no-files-found: error
