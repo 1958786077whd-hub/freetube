@@ -1,0 +1,58 @@
+name: Build SideStore-compatible upstream FreeTube IPA
+
+on:
+  push:
+    branches:
+      - build-upstream-clean-20260831
+
+jobs:
+  build:
+    runs-on: macos-26
+
+    steps:
+      - name: Checkout exact upstream source
+        uses: actions/checkout@v5
+
+      - name: Select Xcode 26.6
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+
+      - name: Build FreeTube without Xcode debug dylib layout
+        run: |
+          xcodebuild \
+            -project FreeTube/FreeTube.xcodeproj \
+            -scheme FreeTube \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            ENABLE_DEBUG_DYLIB=NO \
+            build
+
+      - name: Verify app layout
+        run: |
+          APP=build/Build/Products/Release-iphoneos/FreeTube.app
+          test -f "$APP/FreeTube"
+          test ! -e "$APP/FreeTube.debug.dylib"
+          test ! -e "$APP/__preview.dylib"
+          file "$APP/FreeTube"
+          du -h "$APP/FreeTube"
+
+      - name: Package IPA
+        run: |
+          rm -rf Payload
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/FreeTube.app Payload/
+          ditto -c -k --sequesterRsrc --keepParent Payload FreeTube-SideStore-unsigned.ipa
+          unzip -t FreeTube-SideStore-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: FreeTube-SideStore-IPA
+          path: FreeTube-SideStore-unsigned.ipa
+          if-no-files-found: error
